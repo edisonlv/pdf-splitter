@@ -12,10 +12,10 @@ jobs:
     runs-on: windows-latest
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v2
     
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v2
       with:
         python-version: '3.9'
         
@@ -30,7 +30,7 @@ jobs:
         pyinstaller --noconfirm --onefile --windowed --name "PDF分割工具" pdf_splitter_tkinter.py
       
     - name: Upload build artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v2
       with:
         name: PDF分割工具
         path: dist/PDF分割工具.exe
