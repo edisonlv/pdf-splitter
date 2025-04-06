@@ -1,0 +1,74 @@
+def update_region_list(self):
+        # 清除列表
+        self.region_listbox.delete(0, tk.END)
+        
+        # 存储列表索引到文件路径和页码的映射
+        self.region_map = {}
+        current_index = 0
+        
+        if not self.pdf_files:
+            # 如果没有文件，显示提示信息
+            self.region_listbox.insert(tk.END, "请先添加PDF文件")
+            return
+            
+        # 遍历所有PDF文件
+        for file_path in self.pdf_files:
+            # 显示文件标题
+            filename = os.path.basename(file_path)
+            self.region_listbox.insert(tk.END, f"=== {filename} ===")
+            current_index += 1
+            
+            try:
+                # 打开PDF文件获取总页数
+                with fitz.open(file_path) as pdf:
+                    total_pages = len(pdf)
+                    
+                    # 确保selected_regions中有这个文件的条目
+                    if file_path not in self.selected_regions:
+                        self.selected_regions[file_path] = []
+                    
+                    # 获取当前文件的所有选定区域
+                    regions = self.selected_regions[file_path]
+                    
+                    # 为每一页创建一个映射
+                    page_regions = {}
+                    for region in regions:
+                        page_num = region["page"]
+                        if page_num not in page_regions:
+                            page_regions[page_num] = []
+                        page_regions[page_num].append(region)
+                    
+                    # 显示所有页面
+                    for page_num in range(1, total_pages + 1):
+                        # 获取当前页面的区域
+                        page_regions_list = page_regions.get(page_num, [])
+                        
+                        if not page_regions_list:
+                            # 如果页面没有选定区域
+                            display_text = f"页面 {page_num}: [文件名] {filename}-{page_num:03d} [无选定区域]"
+                            self.region_listbox.insert(tk.END, display_text)
+                            self.region_map[current_index] = (file_path, page_num)
+                            current_index += 1
+                        else:
+                            # 显示页面上的所有区域
+                            for region in page_regions_list:
+                                text = region.get("text", "").strip()
+                                if text:
+                                    display_text = f"页面 {page_num}: [文件名] {text}"
+                                else:
+                                    display_text = f"页面 {page_num}: [文件名] {filename}-{page_num:03d}"
+                                self.region_listbox.insert(tk.END, display_text)
+                                self.region_map[current_index] = (file_path, page_num)
+                                current_index += 1
+                    
+            except Exception as e:
+                # 如果打开PDF文件出错，显示错误信息
+                self.region_listbox.insert(tk.END, f"[错误] 无法打开文件: {str(e)}")
+                current_index += 1
+            
+            # 添加空行分隔不同文件
+            self.region_listbox.insert(tk.END, "")
+            current_index += 1
+        
+        # 绑定双击事件
+        self.region_listbox.bind("<Double-1>", self.on_region_double_click)

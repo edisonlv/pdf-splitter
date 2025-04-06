@@ -26,6 +26,12 @@ class PDFSplitterApp:
         self.pdf_files = []  # 存储所有待处理的PDF文件路径
         self.current_file_index = -1  # 当前显示的文件索引
         
+        # 新增：图幅尺寸相关变量
+        self.page_sizes = {}  # 存储每个文件的页面尺寸信息 {file_path: {size_key: [page_numbers]}}
+        self.page_templates = {}  # 存储每种尺寸的页码提取区域设置 {size_key: {current_coords, total_coords}}
+        self.filename_templates = {}  # 存储每种尺寸的文件名提取区域设置 {size_key: [coords]}
+        self.current_size_key = None  # 当前正在设置的尺寸key
+        
         # 选择区域变量
         self.start_x = None
         self.start_y = None
@@ -58,21 +64,26 @@ class PDFSplitterApp:
         self.split_button = ttk.Button(control_frame, text="分割PDF", command=self.split_pdf, state=tk.DISABLED)
         self.split_button.pack(side=tk.LEFT, padx=5)
         
+        # 添加识别图幅按钮
+        self.detect_size_button = ttk.Button(control_frame, text="识别图幅尺寸", 
+                                           command=self.detect_page_sizes)
+        self.detect_size_button.pack(side=tk.LEFT, padx=5)
+        
         # 添加文件名模板按钮
-        self.filename_button = ttk.Button(control_frame, text="设置文件名模板", 
+        self.filename_button = ttk.Button(control_frame, text="设置文件名提取区域", 
                                         command=self.start_filename_template_selection)
         self.filename_button.pack(side=tk.LEFT, padx=5)
         
-        # 修改模板设置按钮
-        self.template_button1 = ttk.Button(control_frame, text="设置页码模板(双区域)", 
+        # 修改页码模板设置按钮
+        self.template_button1 = ttk.Button(control_frame, text="设置页码提取区域(双区域)", 
                                          command=lambda: self.start_template_selection(mode="double"))
         self.template_button1.pack(side=tk.LEFT, padx=5)
         
-        self.template_button2 = ttk.Button(control_frame, text="设置页码模板(单区域)", 
+        self.template_button2 = ttk.Button(control_frame, text="设置页码提取区域(单区域)", 
                                          command=lambda: self.start_template_selection(mode="single"))
         self.template_button2.pack(side=tk.LEFT, padx=5)
         
-        self.template_status = ttk.Label(control_frame, text="未设置页码模板")
+        self.template_status = ttk.Label(control_frame, text="未设置页码提取区域")
         self.template_status.pack(side=tk.LEFT, padx=5)
         
         # 主内容区域
@@ -141,14 +152,14 @@ class PDFSplitterApp:
         self.region_listbox = tk.Listbox(region_frame)
         self.region_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.region_listbox.bind("<<ListboxSelect>>", self.on_region_select)
+        self.region_listbox.bind("<Double-Button-1>", self.on_region_double_click)
         
         region_btn_frame = ttk.Frame(region_frame)
         region_btn_frame.pack(fill=tk.X, padx=5, pady=5)
         
         ttk.Button(region_btn_frame, text="删除区域", command=self.remove_region).pack(side=tk.LEFT, padx=5)
         ttk.Button(region_btn_frame, text="清除所有", command=self.clear_regions).pack(side=tk.LEFT, padx=5)
-        # 添加编辑内容按钮
-        ttk.Button(region_btn_frame, text="编辑内容", command=self.edit_region_content).pack(side=tk.LEFT, padx=5)
+        ttk.Button(region_btn_frame, text="修改内容", command=self.edit_selected_content).pack(side=tk.LEFT, padx=5)
     
     def add_pdf_files(self):
         """添加PDF文件到列表"""
@@ -402,6 +413,8 @@ class PDFSplitterApp:
         if not self.rect_id or not self.pdf_document:
             return
         
+        print(f"DEBUG: on_mouse_up - filename_mode={self.filename_template_mode}, selection_step={self.selection_step}") # Add this
+        
         # 获取最终位置
         end_x = self.canvas.canvasx(event.x)
         end_y = self.canvas.canvasy(event.y)
@@ -466,7 +479,8 @@ class PDFSplitterApp:
             region = {
                 'page': self.current_page,
                 'rect': (x1, y1, x2, y2),
-                'text': text
+                'text': text if text else "",  # 即使没有文本也保存空字符串
+                'has_text': bool(text.strip())  # 添加标记表示是否有文本
             }
             
             # 确保当前文件的区域列表已初始化
@@ -482,97 +496,83 @@ class PDFSplitterApp:
         self.rect_id = None
         self.redraw_regions()
     
-    def extract_text_from_selection(self, x1, y1, x2, y2):
-        if not self.pdf_document:
-            return ""
-        
-        # 获取当前页面
-        page = self.pdf_document[self.current_page]
-        
-        # 计算选择区域在PDF坐标系中的位置
-        zoom = 2.0 * self.scale_factor
-        pdf_x1 = x1 / zoom
-        pdf_y1 = y1 / zoom
-        pdf_x2 = x2 / zoom
-        pdf_y2 = y2 / zoom
-        
-        # 尝试使用更可靠的文本提取方法
+    def _extract_text_from_rect(self, page, rect):
+        """Helper method to extract and sort text from a given rectangle on a page."""
         try:
-            # 使用dict模式获取文本块信息
-            rect = fitz.Rect(pdf_x1, pdf_y1, pdf_x2, pdf_y2)
+            # Use dict mode for better structure
             blocks = page.get_text("dict", clip=rect)["blocks"]
             
-            # 改进的文本排序逻辑：首先按行分组，然后在每行内从左到右排序
-            # 定义行容差 - 如果两个文本块的y坐标差距小于此值，认为它们在同一行
-            line_tolerance = 5 / zoom  # 像素转换为PDF坐标
+            # Define line tolerance based on zoom (assuming default zoom/scale)
+            # TODO: Consider passing scale factor if needed for dynamic tolerance
+            line_tolerance = 5 / (2.0 * self.scale_factor) 
             
-            # 收集所有文本span
             all_spans = []
             for block in blocks:
-                if block["type"] == 0:  # 文本块
+                if block["type"] == 0:  # Text block
                     for line in block["lines"]:
                         for span in line["spans"]:
-                            # y_pos使用span的中点而不是顶部，这样更准确地表示行位置
                             y_pos = (span["bbox"][1] + span["bbox"][3]) / 2
-                            x_pos = span["bbox"][0]  # 左边缘位置
+                            x_pos = span["bbox"][0]
                             all_spans.append((y_pos, x_pos, span["text"]))
             
             if not all_spans:
                 return ""
                 
-            # 按y坐标粗略排序
-            all_spans.sort(key=lambda x: x[0])
+            # Sort primarily by Y, then X
+            all_spans.sort(key=lambda x: (x[0], x[1]))
             
-            # 将span分组到不同的行
+            # Group spans into lines based on Y-coordinate and tolerance
             lines = []
-            current_line = [all_spans[0]]
-            current_y = all_spans[0][0]
-            
-            for span in all_spans[1:]:
-                span_y = span[0]
-                # 如果y坐标相差小于tolerance，认为是同一行
-                if abs(span_y - current_y) < line_tolerance:
-                    current_line.append(span)
-                else:
-                    # 将当前行按x坐标排序并添加到lines
-                    current_line.sort(key=lambda x: x[1])
-                    lines.append(current_line)
-                    # 开始新行
-                    current_line = [span]
-                    current_y = span_y
-            
-            # 添加最后一行
-            if current_line:
+            if all_spans:
+                current_line = [all_spans[0]]
+                last_y = all_spans[0][0]
+                
+                for span in all_spans[1:]:
+                    span_y = span[0]
+                    if abs(span_y - last_y) < line_tolerance:
+                        current_line.append(span)
+                    else:
+                        # Sort current line by X before adding
+                        current_line.sort(key=lambda x: x[1])
+                        lines.append(current_line)
+                        # Start new line
+                        current_line = [span]
+                        last_y = span_y
+                
+                # Add the last line
                 current_line.sort(key=lambda x: x[1])
                 lines.append(current_line)
             
-            # 从每行中提取文本并合并
-            result_text = ""
-            for line in lines:
-                line_text = " ".join([span[2] for span in line])
-                if result_text:
-                    result_text += " " + line_text
-                else:
-                    result_text = line_text
-            
-            text = result_text
+            # Join text within lines and then join lines
+            result_text = " ".join([" ".join(span[2] for span in line) for line in lines])
             
         except Exception as e:
-            # 回退到简单模式
+            print(f"Warning: Text extraction using dict failed, falling back. Error: {e}")
+            # Fallback to simple text extraction
             try:
-                rect = fitz.Rect(pdf_x1, pdf_y1, pdf_x2, pdf_y2)
-                text = page.get_text("text", clip=rect)
-            except:
-                text = ""
+                result_text = page.get_text("text", clip=rect)
+            except Exception as fallback_e:
+                print(f"Error: Fallback text extraction failed. Error: {fallback_e}")
+                result_text = ""
         
-        # 处理多行文本：将换行符替换为空格，并移除多余空格
-        text = text.replace('\n', ' ').replace('\r', ' ')
-        # 替换连续的空格为单个空格
-        text = re.sub(r'\s+', ' ', text)
-        text = text.strip()
-        
+        # Clean up whitespace
+        text = result_text.replace('\\n', ' ').replace('\\r', ' ')
+        text = re.sub(r'\\s+', ' ', text).strip()
         return text
-    
+
+    def extract_text_from_selection(self, x1, y1, x2, y2):
+        if not self.pdf_document:
+            return ""
+        
+        # Get current page
+        page = self.pdf_document[self.current_page]
+        
+        # Calculate selection rectangle in PDF coordinates
+        zoom = 2.0 * self.scale_factor
+        pdf_rect = fitz.Rect(x1 / zoom, y1 / zoom, x2 / zoom, y2 / zoom)
+        
+        return self._extract_text_from_rect(page, pdf_rect)
+
     def update_region_list(self):
         """更新区域列表显示"""
         # 清除列表
@@ -582,102 +582,117 @@ class PDFSplitterApp:
         self.region_map = {}
         current_index = 0
         
+        # 检查是否有任何区域
+        has_any_regions = False
+        for file_path in self.pdf_files:
+            if file_path in self.selected_regions and self.selected_regions[file_path]:
+                has_any_regions = True
+                break
+        
         if not self.pdf_files:
             # 如果没有文件，显示提示信息
             self.region_listbox.insert(tk.END, "请先添加PDF文件")
             return
-            
-        # 遍历所有文件
+        elif not has_any_regions:
+            # 如果有文件但没有区域，显示提示信息
+            self.region_listbox.insert(tk.END, "请在PDF上选择区域")
+            return
+        
+        # 按图幅尺寸分组显示
         for file_path in self.pdf_files:
             file_name = os.path.basename(file_path)
+            regions = self.selected_regions.get(file_path, [])
+            
+            if not regions:
+                continue  # 跳过没有区域的文件
             
             # 添加文件名作为标题
             self.region_listbox.insert(tk.END, f"=== {file_name} ===")
             current_index += 1
             
-            try:
-                # 打开PDF文件获取总页数
-                with fitz.open(file_path) as pdf:
-                    total_pages = len(pdf)
-                    
-                    # 确保selected_regions中有这个文件的条目
-                    if file_path not in self.selected_regions:
-                        self.selected_regions[file_path] = []
-                    
-                    # 获取当前文件的所有选定区域
-                    regions = self.selected_regions[file_path]
-                    
-                    # 为每一页创建一个映射
-                    page_regions = {}
-                    for region in regions:
-                        page_num = region["page"]
-                        if page_num not in page_regions:
-                            page_regions[page_num] = []
-                        page_regions[page_num].append(region)
-                    
-                    # 显示所有页面
-                    for page_num in range(total_pages):
-                        if page_num in page_regions:
-                            # 显示该页面的所有区域
-                            for region in page_regions[page_num]:
-                                if "current_page" in region and "filename" in region:
-                                    # 既有页码又有文件名
-                                    item_text = f"页面 {page_num + 1}: [第 {region['current_page']} 张] [{region['filename']}]"
-                                elif region.get("is_filename"):
-                                    # 只有文件名
-                                    item_text = f"页面 {page_num + 1}: [文件名] {region['filename']}"
-                                elif "current_page" in region and "total_pages" in region:
-                                    # 只有页码
-                                    item_text = f"页面 {page_num + 1}: 第 {region['current_page']} 张 共 {region['total_pages']} 张"
-                                else:
-                                    # 普通区域
-                                    text_preview = region["text"].strip()
-                                    if len(text_preview) > 30:
-                                        text_preview = text_preview[:30] + "..."
-                                    item_text = f"页面 {page_num + 1}: {text_preview}"
-                                
-                                self.region_listbox.insert(tk.END, item_text)
-                                # 保存映射关系
-                                self.region_map[current_index] = (file_path, page_num)
-                                current_index += 1
-                        else:
-                            # 显示没有区域的页面
-                            item_text = f"页面 {page_num + 1}: [无内容]"
-                            self.region_listbox.insert(tk.END, item_text)
-                            # 保存映射关系
-                            self.region_map[current_index] = (file_path, page_num)
-                            current_index += 1
-                    
-                    # 添加空行分隔
-                    self.region_listbox.insert(tk.END, "")
+            # 如果有图幅信息，按图幅分组显示
+            if file_path in self.page_sizes and self.page_sizes[file_path]:
+                # 创建页码到尺寸的映射
+                page_to_size = {}
+                for size_key, pages in self.page_sizes[file_path].items():
+                    for page_num in pages:
+                        page_to_size[page_num] = size_key
+                
+                # 按图幅分组区域
+                size_groups = {}
+                for region in regions:
+                    page_num = region['page']
+                    size_key = page_to_size.get(page_num, "未知尺寸")
+                    if size_key not in size_groups:
+                        size_groups[size_key] = []
+                    size_groups[size_key].append(region)
+                
+                # 显示每个图幅组的区域
+                for size_key in sorted(size_groups.keys()):
+                    # 添加图幅尺寸标题
+                    template_status = "（已设置模板）" if size_key in self.page_templates else "（未设置模板）"
+                    self.region_listbox.insert(tk.END, f"--- 图幅：{size_key} {template_status} ---")
                     current_index += 1
                     
-            except Exception as e:
-                self.showerror("错误", f"处理文件 {file_name} 时出错: {str(e)}")
-                continue
-        
-        # 绑定双击事件
-        self.region_listbox.bind("<Double-1>", self.on_region_double_click)
-    def on_region_double_click(self, event):
-        """处理区域列表的双击事件"""
-        selection = self.region_listbox.curselection()
-        if not selection:
-            return
+                    # 显示该图幅下的区域
+                    for region in sorted(size_groups[size_key], key=lambda x: x['page']):
+                        page_num = region['page'] + 1
+                        
+                        if 'current_page' in region and 'filename' in region:
+                            # 既有页码又有文件名
+                            item_text = f"页面 {page_num}: [第 {region['current_page']} 张] [{region['filename']}]"
+                        elif region.get('is_filename'):
+                            # 只有文件名
+                            item_text = f"页面 {page_num}: [文件名] {region['filename']}"
+                        elif 'current_page' in region and 'total_pages' in region:
+                            # 只有页码
+                            item_text = f"页面 {page_num}: 第 {region['current_page']} 张 共 {region['total_pages']} 张"
+                        else:
+                            # 普通区域
+                            text_preview = region['text'].strip()
+                            if not text_preview:
+                                item_text = f"页面 {page_num}: [无内容]"
+                            else:
+                                if len(text_preview) > 30:
+                                    text_preview = text_preview[:30] + "..."
+                                item_text = f"页面 {page_num}: {text_preview}"
+                        
+                        self.region_listbox.insert(tk.END, item_text)
+                        # 保存映射关系
+                        self.region_map[current_index] = (file_path, region['page'])
+                        current_index += 1
+                    
+                    # 添加空行分隔不同图幅
+                    self.region_listbox.insert(tk.END, "")
+                    current_index += 1
+            else:
+                # 如果没有图幅信息，按原来的方式显示
+                for region in sorted(regions, key=lambda x: x['page']):
+                    page_num = region['page'] + 1
+                    
+                    if 'current_page' in region and 'filename' in region:
+                        item_text = f"页面 {page_num}: [第 {region['current_page']} 张] [{region['filename']}]"
+                    elif region.get('is_filename'):
+                        item_text = f"页面 {page_num}: [文件名] {region['filename']}"
+                    elif 'current_page' in region and 'total_pages' in region:
+                        item_text = f"页面 {page_num}: 第 {region['current_page']} 张 共 {region['total_pages']} 张"
+                    else:
+                        text_preview = region['text'].strip()
+                        if not text_preview:
+                            item_text = f"页面 {page_num}: [无内容]"
+                        else:
+                            if len(text_preview) > 30:
+                                text_preview = text_preview[:30] + "..."
+                            item_text = f"页面 {page_num}: {text_preview}"
+                    
+                    self.region_listbox.insert(tk.END, item_text)
+                    # 保存映射关系
+                    self.region_map[current_index] = (file_path, region['page'])
+                    current_index += 1
             
-        index = selection[0]
-        if index not in self.region_map:
-            return
-            
-        # 获取文件路径和页码
-        file_path, page_num = self.region_map[index]
-        
-        # 如果当前文件与选中的不同，加载新文件
-        if self.pdf_path != file_path:
-            self.load_pdf_file(self.pdf_files.index(file_path))
-        
-        # 跳转到指定页面
-        self.current_page = page_num
-        self.update_page_display()
+            # 添加空行分隔不同文件
+            self.region_listbox.insert(tk.END, "")
+            current_index += 1
     
     def on_region_select(self, event):
         """处理区域列表的单击选择事件"""
@@ -693,16 +708,151 @@ class PDFSplitterApp:
         # 获取文件路径和页码
         file_path, page_num = self.region_map[index]
         
-        # 切换到对应页面
-        if self.current_page != page_num or self.pdf_path != file_path:
-            # 如果当前文件与选中的不同，加载新文件
-            if self.pdf_path != file_path:
-                self.load_pdf_file(self.pdf_files.index(file_path))
+        # 如果当前文件与选中的不同，加载新文件
+        if self.pdf_path != file_path:
+            self.load_pdf_file(self.pdf_files.index(file_path))
+        
+        # 跳转到指定页面
+        self.current_page = page_num
+        self.update_page_display()
+    
+    def on_region_double_click(self, event):
+        """处理区域列表的双击事件"""
+        self.edit_selected_content()
+    
+    def edit_selected_content(self):
+        """编辑选中区域的内容"""
+        selection = self.region_listbox.curselection()
+        if not selection:
+            self.showwarning("警告", "请先选择一个区域")
+            return
             
-            # 跳转到指定页面
-            self.current_page = page_num
-            self.update_page_display()
-
+        index = selection[0]
+        if index not in self.region_map:
+            return
+            
+        # 获取文件路径和页码
+        file_path, page_num = self.region_map[index]
+        
+        # 找到对应的区域
+        region = None
+        for r in self.selected_regions[file_path]:
+            if r['page'] == page_num:
+                region = r
+                break
+                
+        if not region:
+            return
+            
+        # 显示编辑对话框
+        self.show_content_edit_dialog(file_path, page_num, region)
+    
+    def show_content_edit_dialog(self, file_path, page_num, region):
+        """显示内容编辑对话框"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("编辑页面内容")
+        dialog.geometry("400x200")
+        dialog.transient(self.root)
+        dialog.grab_set()  # 模态对话框
+        
+        # 创建主框架
+        main_frame = ttk.Frame(dialog, padding=0)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 创建标题栏 - 蓝色
+        title_frame = tk.Frame(main_frame, height=6, bg="#3498db")
+        title_frame.pack(fill=tk.X)
+        
+        # 内容区域
+        content_frame = ttk.Frame(main_frame, padding=(20, 15, 20, 10))
+        content_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 标题
+        header_label = ttk.Label(content_frame, 
+                               text=f"编辑第 {page_num + 1} 页内容", 
+                               font=("Arial", 12, "bold"))
+        header_label.pack(anchor=tk.W, pady=(0, 10))
+        
+        # 文本输入框
+        text_frame = ttk.Frame(content_frame)
+        text_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        text_entry = ttk.Entry(text_frame)
+        text_entry.pack(fill=tk.X, padx=5, pady=5)
+        
+        # 设置当前内容
+        current_text = ""
+        if region.get('is_filename', False):
+            current_text = region.get('filename', '')
+            if current_text == '[无内容]':
+                current_text = ''
+        else:
+            current_text = region.get('text', '')
+            if current_text == '[无内容]':
+                current_text = ''
+        text_entry.insert(0, current_text)
+        text_entry.focus_set()  # 设置焦点
+        text_entry.select_range(0, tk.END)  # 选中所有文本
+        
+        # 分隔线
+        separator = ttk.Separator(main_frame, orient="horizontal")
+        separator.pack(fill=tk.X, padx=0, pady=0)
+        
+        # 按钮区域
+        btn_frame = ttk.Frame(main_frame, padding=(15, 10))
+        btn_frame.pack(fill=tk.X)
+        
+        def on_save():
+            new_text = text_entry.get().strip()
+            if not new_text:
+                self.showwarning("警告", "请输入内容")
+                return
+                
+            # 更新区域信息
+            if region.get('is_filename', False):
+                # 如果是文件名区域
+                region['filename'] = new_text
+                region['filename_text'] = f"文件名: {new_text}"
+                region['text'] = f"文件名: {new_text}"
+                
+                # 更新自定义文件名字典
+                if file_path not in self.custom_filenames:
+                    self.custom_filenames[file_path] = {}
+                self.custom_filenames[file_path][page_num] = new_text
+            else:
+                # 如果是普通区域
+                region['text'] = new_text
+            
+            # 更新显示
+            self.update_region_list()
+            dialog.destroy()
+            
+            # 显示成功消息
+            self.showinfo("成功", "内容已更新")
+        
+        def on_cancel():
+            dialog.destroy()
+        
+        style = ttk.Style()
+        style.configure("Accent.TButton", font=("Arial", 10))
+        
+        # 取消按钮
+        cancel_btn = ttk.Button(btn_frame, text="取消", command=on_cancel)
+        cancel_btn.pack(side=tk.LEFT, padx=5)
+        
+        # 保存按钮
+        save_btn = ttk.Button(btn_frame, text="保存", style="Accent.TButton", command=on_save)
+        save_btn.pack(side=tk.RIGHT, padx=5)
+        
+        # 绑定回车键到保存按钮
+        dialog.bind("<Return>", lambda e: save_btn.invoke())
+        dialog.bind("<Escape>", lambda e: cancel_btn.invoke())
+        
+        # 居中显示对话框
+        self.center_dialog(dialog)
+        
+        dialog.wait_window()
+    
     def remove_region(self):
         """删除选中的区域"""
         selection = self.region_listbox.curselection()
@@ -794,10 +944,25 @@ class PDFSplitterApp:
             progress_bar = ttk.Progressbar(progress_window, variable=progress_var, maximum=100)
             progress_bar.pack(fill=tk.X, padx=20, pady=10)
             
-            # 计算总页数
-            total_files = len(self.pdf_files)
-            processed_files = 0
-            total_pages_processed = 0
+            # 计算总页数和需要处理的页面
+            total_pages_to_process = 0
+            pages_to_process = []  # [(file_path, page_num), ...]
+            
+            for file_path in self.pdf_files:
+                if self.current_size_key:
+                    # 如果是为特定图幅设置模板，只处理该图幅的页面
+                    if self.current_size_key in self.page_sizes[file_path]:
+                        page_nums = self.page_sizes[file_path][self.current_size_key]
+                        total_pages_to_process += len(page_nums)
+                        pages_to_process.extend([(file_path, page_num) for page_num in page_nums])
+                else:
+                    # 如果不是特定图幅，处理所有页面
+                    pdf = fitz.open(file_path)
+                    total_pages_to_process += len(pdf)
+                    pages_to_process.extend([(file_path, i) for i in range(len(pdf))])
+                    pdf.close()
+            
+            processed_pages = 0
             total_pages_recognized = 0
             
             # 保存现有的文件名区域
@@ -809,6 +974,57 @@ class PDFSplitterApp:
                     if filename_regions:
                         saved_filename_regions[file_path] = filename_regions
             
+            # 处理每个页面
+            current_pdf = None
+            current_file = None
+            
+            for file_path, page_num in pages_to_process:
+                # 如果是新文件，关闭旧文件并打开新文件
+                if current_file != file_path:
+                    if current_pdf:
+                        current_pdf.close()
+                    current_pdf = fitz.open(file_path)
+                    current_file = file_path
+                    
+                    # 更新进度标签
+                    progress_label.config(text=f"正在处理: {os.path.basename(file_path)}")
+                    progress_window.update()
+                    
+                    # 清除当前文件的页码识别结果，但保留文件名区域和其他图幅的结果
+                    if file_path in self.selected_regions:
+                        if self.current_size_key:
+                            # 如果是特定图幅，只清除该图幅的页面结果
+                            self.selected_regions[file_path] = [
+                                region for region in self.selected_regions[file_path]
+                                if region.get('is_filename', False) or  # 保留文件名区域
+                                page_num not in self.page_sizes[file_path].get(self.current_size_key, [])  # 保留其他图幅的结果
+                            ]
+                        else:
+                            # 如果不是特定图幅，保留文件名区域
+                            self.selected_regions[file_path] = [
+                                region for region in self.selected_regions[file_path]
+                                if region.get('is_filename', False)
+                            ]
+                    else:
+                        self.selected_regions[file_path] = []
+                
+                # 获取页面
+                page = current_pdf[page_num]
+                
+                # 计算选择区域在PDF坐标系中的位置
+                zoom = 2.0 * self.scale_factor
+                
+                # 提取页码文本
+                x1, y1, x2, y2 = self.current_page_coords
+                pdf_rect1 = fitz.Rect(x1/zoom, y1/zoom, x2/zoom, y2/zoom)
+                current_text = page.get_text("text", clip=pdf_rect1)
+                
+                # 提取当前页码
+                current_number = self.extract_number_from_text(current_text)
+                
+                if self.template_mode == "double" and self.total_pages_coords:
+                    # 提取总页数
+                    x1, y1, x2, y2 = self.total_pages_coords
             # 处理每个PDF文件
             for file_path in self.pdf_files:
                 # 清除当前文件的页码识别结果，但保留文件名区域
@@ -883,6 +1099,8 @@ class PDFSplitterApp:
                                 'page_text': text,
                             }
                             self.selected_regions[file_path].append(region)
+                            print(f"DEBUG: Added region for {file_path}, page {page_num}: {region}") # Add this line
+                            self.update_region_list()
                         
                         total_pages_recognized += 1
                     
@@ -940,6 +1158,10 @@ class PDFSplitterApp:
         else:
             self.template_status.config(text='请框选页码位置...')
             self.showinfo('提示', '请框选页码位置')
+            
+        # 如果正在为特定尺寸设置模板，更新状态显示
+        if self.current_size_key:
+            self.template_status.config(text=f'正在为图幅 {self.current_size_key} 设置模板...')
             
         # 下面的操作将在鼠标操作完成后执行
     
@@ -999,70 +1221,88 @@ class PDFSplitterApp:
         regions = self.selected_regions.get(file_path, [])
         custom_filenames = self.custom_filenames.get(file_path, {})
         
-        # 如果没有任何区域信息，但有自定义文件名，则尝试根据自定义文件名分割
-        if (not regions or all(region.get('is_filename', False) for region in regions)) and custom_filenames:
-            # 根据自定义文件名分割
-            return self.process_by_filenames(file_path, output_dir, custom_filenames, progress_window)
-        
         # 打开PDF文件
         pdf_document = fitz.open(file_path)
-        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        total_pages = len(pdf_document)
         
-        if self.template_mode == "double":
-            # 双区域模式的处理逻辑
-            documents = self.process_double_mode(regions)
-        else:
-            # 单区域模式的处理逻辑
-            documents = self.process_single_mode(regions)
-        
-        # 创建分割后的PDF文件
-        for i, doc_info in enumerate(documents, 1):
-            # 更新进度信息
-            if progress_window:
-                progress_window.update()
+        try:
+            # 如果没有任何区域信息，但有自定义文件名，则尝试根据自定义文件名分割
+            if (not regions or all(region.get('is_filename', False) for region in regions)) and custom_filenames:
+                result = self.process_by_filenames(file_path, output_dir, custom_filenames, progress_window)
+                if result:  # 如果成功处理了，直接返回
+                    return
+                # 如果处理失败（比如所有页面都是无内容），继续执行下面的逻辑
             
-            output_doc = fitz.open()
+            # 如果只有一页，且没有识别到任何内容或区域，直接复制整个文件
+            if total_pages == 1 and (not regions or all(not region.get('text', '').strip() for region in regions)):
+                output_filename = os.path.splitext(os.path.basename(file_path))[0] + "_完整文件.pdf"
+                output_path = os.path.join(output_dir, output_filename)
+                
+                # 直接复制整个文件
+                output_doc = fitz.open()
+                output_doc.insert_pdf(pdf_document)
+                self.optimize_and_save_pdf(output_doc, output_path)
+                output_doc.close()
+                return
+            
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
             
             if self.template_mode == "double":
-                total_pages, pages = doc_info
-                for page_index, current_page in pages:
-                    output_doc.insert_pdf(pdf_document, from_page=page_index, to_page=page_index)
-                first_page = pages[0][1]
-                last_page = pages[-1][1]
-                
-                # 检查是否有自定义文件名
-                custom_name = None
-                if file_path in self.custom_filenames and pages[0][0] in self.custom_filenames[file_path]:
-                    custom_name = self.custom_filenames[file_path][pages[0][0]]
-                
-                if custom_name:
-                    output_filename = f"{custom_name}.pdf"
-                else:
-                    output_filename = f"{base_name}_{i:02d}_第{first_page}至{last_page}张共{total_pages}张.pdf"
+                # 双区域模式的处理逻辑
+                documents = self.process_double_mode(regions)
             else:
-                start_page, end_page, page_numbers = doc_info
-                for page_index in range(start_page, end_page + 1):
-                    output_doc.insert_pdf(pdf_document, from_page=page_index, to_page=page_index)
+                # 单区域模式的处理逻辑
+                documents = self.process_single_mode(regions)
+            
+            # 创建分割后的PDF文件
+            for i, doc_info in enumerate(documents, 1):
+                # 更新进度信息
+                if progress_window:
+                    progress_window.update()
                 
-                # 检查是否有自定义文件名
-                custom_name = None
-                if file_path in self.custom_filenames and start_page in self.custom_filenames[file_path]:
-                    custom_name = self.custom_filenames[file_path][start_page]
+                output_doc = fitz.open()
                 
-                if custom_name:
-                    output_filename = f"{custom_name}.pdf"
+                if self.template_mode == "double":
+                    total_pages, pages = doc_info
+                    for page_index, current_page in pages:
+                        output_doc.insert_pdf(pdf_document, from_page=page_index, to_page=page_index)
+                    first_page = pages[0][1]
+                    last_page = pages[-1][1]
+                    
+                    # 检查是否有自定义文件名
+                    custom_name = None
+                    if file_path in self.custom_filenames and pages[0][0] in self.custom_filenames[file_path]:
+                        custom_name = self.custom_filenames[file_path][pages[0][0]]
+                    
+                    if custom_name and custom_name != "[无内容]":
+                        output_filename = f"{custom_name}.pdf"
+                    else:
+                        output_filename = f"{base_name}_{i:02d}_第{first_page}至{last_page}张共{total_pages}张.pdf"
                 else:
-                    output_filename = f"{base_name}_{i:02d}_第{page_numbers[0]}至{page_numbers[-1]}张.pdf"
+                    start_page, end_page, page_numbers = doc_info
+                    for page_index in range(start_page, end_page + 1):
+                        output_doc.insert_pdf(pdf_document, from_page=page_index, to_page=page_index)
+                    
+                    # 检查是否有自定义文件名
+                    custom_name = None
+                    if file_path in self.custom_filenames and start_page in self.custom_filenames[file_path]:
+                        custom_name = self.custom_filenames[file_path][start_page]
+                    
+                    if custom_name and custom_name != "[无内容]":
+                        output_filename = f"{custom_name}.pdf"
+                    else:
+                        output_filename = f"{base_name}_{i:02d}_第{page_numbers[0]}至{page_numbers[-1]}张.pdf"
+                    
+                    # 使用更优化的参数保存PDF
+                    output_path = os.path.join(output_dir, output_filename)
+                    
+                    # 调用自定义优化方法
+                    self.optimize_and_save_pdf(output_doc, output_path)
+                    
+                    output_doc.close()
             
-            # 使用更优化的参数保存PDF
-            output_path = os.path.join(output_dir, output_filename)
-            
-            # 调用自定义优化方法
-            self.optimize_and_save_pdf(output_doc, output_path)
-            
-            output_doc.close()
-        
-        pdf_document.close()
+        finally:
+            pdf_document.close()
 
     def process_by_filenames(self, file_path, output_dir, custom_filenames, parent_progress_window=None):
         """根据连续的相同文件名来分割PDF"""
@@ -1071,21 +1311,29 @@ class PDFSplitterApp:
             pdf_document = fitz.open(file_path)
             base_name = os.path.splitext(os.path.basename(file_path))[0]
             
+            # 过滤掉标记为无内容的页面
+            valid_filenames = {page_num: name for page_num, name in custom_filenames.items() 
+                             if name != "[无内容]"}
+            
+            if not valid_filenames:
+                self.showwarning("警告", "没有找到有效的文件名，无法进行分割。")
+                return False
+            
             # 按页码排序自定义文件名
-            sorted_pages = sorted(custom_filenames.keys())
+            sorted_pages = sorted(valid_filenames.keys())
             
             if not sorted_pages:
-                return
+                return False
             
             # 按文件名组织页面
-            current_name = custom_filenames[sorted_pages[0]]
+            current_name = valid_filenames[sorted_pages[0]]
             start_page = sorted_pages[0]
             groups = []
             
             # 遍历所有页面，将连续相同文件名的页面分为一组
             for i in range(1, len(sorted_pages)):
                 page_num = sorted_pages[i]
-                current_filename = custom_filenames[page_num]
+                current_filename = valid_filenames[page_num]
                 
                 # 如果文件名变化或者页面不连续，创建一个新组
                 if current_filename != current_name or page_num != sorted_pages[i-1] + 1:
@@ -1342,7 +1590,13 @@ class PDFSplitterApp:
         # 清除之前的选择框
         self.canvas.delete("filename_region_*")
         
-        self.showinfo('提示', '请框选要作为文件名的文本区域')
+        # 如果当前正在为特定图幅尺寸设置模板，显示相应的提示
+        if self.current_size_key:
+            self.template_status.config(text=f"正在为图幅 {self.current_size_key} 设置文件名提取区域...")
+            self.showinfo('提示', f'请为图幅 {self.current_size_key} 框选要作为文件名的文本区域')
+        else:
+            self.template_status.config(text="正在设置文件名提取区域...")
+            self.showinfo('提示', '请框选要作为文件名的文本区域')
 
     def show_filename_selection_dialog(self, text_preview):
         """显示文件名选择对话框"""
@@ -1555,101 +1809,130 @@ class PDFSplitterApp:
             progress_bar = ttk.Progressbar(progress_window, variable=progress_var, maximum=100)
             progress_bar.pack(fill=tk.X, padx=20, pady=10)
             
-            # 计算总页数
-            total_files = len(self.pdf_files)
-            processed_files = 0
-            total_pages_processed = 0
+            # 计算需要处理的页面
+            pages_to_process = []  # [(file_path, page_num), ...]
+            for file_path in self.pdf_files:
+                if self.current_size_key:
+                    # 如果是为特定图幅设置模板，只处理该图幅的页面
+                    if self.current_size_key in self.page_sizes[file_path]:
+                        page_nums = self.page_sizes[file_path][self.current_size_key]
+                        pages_to_process.extend([(file_path, page_num) for page_num in page_nums])
+                else:
+                    # 如果不是特定图幅，处理所有页面
+                    pdf = fitz.open(file_path)
+                    pages_to_process.extend([(file_path, i) for i in range(len(pdf))])
+                    pdf.close()
+            
+            total_pages = len(pages_to_process)
+            processed_pages = 0
             total_pages_recognized = 0
             
-            # 处理每个PDF文件
-            for file_path in self.pdf_files:
-                # 打开PDF文件
-                current_pdf = fitz.open(file_path)
-                file_pages = len(current_pdf)
-                
-                progress_label.config(text=f"正在处理: {os.path.basename(file_path)}")
-                progress_window.update()
-                
-                # 遍历当前文件的所有页面
-                for page_num in range(file_pages):
-                    # 获取页面
-                    page = current_pdf[page_num]
+            # 处理每个页面
+            current_pdf = None
+            current_file = None
+            
+            for file_path, page_num in pages_to_process:
+                # 如果是新文件，关闭旧文件并打开新文件
+                if current_file != file_path:
+                    if current_pdf:
+                        current_pdf.close()
+                    current_pdf = fitz.open(file_path)
+                    current_file = file_path
                     
-                    # 计算选择区域在PDF坐标系中的位置
-                    zoom = 2.0 * self.scale_factor
-                    
-                    # 保持原始选择顺序提取文本
-                    combined_text = []
-                    
-                    # 按照用户框选的原始顺序提取文本
-                    for coords in self.filename_template_coords:
-                        x1, y1, x2, y2 = coords
-                        pdf_rect = fitz.Rect(x1/zoom, y1/zoom, x2/zoom, y2/zoom)
-                        
-                        # 提取文本并清理
-                        text = self.extract_text_from_region(page, pdf_rect)
-                        if text:
-                            combined_text.append(text)
-                    
-                    # 组合所有区域的文本，用"-"连接
-                    if combined_text:
-                        final_text = "-".join(combined_text)
-                        
-                        # 清理非法文件名字符
-                        final_text = re.sub(r'[\\/*?:"<>|]', '_', final_text)
-                        
-                        # 保存到自定义文件名字典
-                        if file_path not in self.custom_filenames:
-                            self.custom_filenames[file_path] = {}
-                        self.custom_filenames[file_path][page_num] = final_text
-                        
-                        # 查找这个页面是否已有区域（例如页码区域）
-                        existing_region = None
-                        for i, region in enumerate(self.selected_regions[file_path]):
-                            if region['page'] == page_num:
-                                existing_region = region
-                                existing_index = i
-                                break
-                        
-                        # 使用所有框选区域的坐标
-                        all_coords = self.filename_template_coords
-                        
-                        if existing_region:
-                            # 如果已有区域，将文件名信息添加到现有区域
-                            self.selected_regions[file_path][existing_index].update({
-                                'all_coords': all_coords,
-                                'is_filename': True,
-                                'filename': final_text,
-                                'filename_text': f"文件名: {final_text}"
-                            })
-                            # 更新文本显示，结合页码和文件名
-                            if 'page_text' in existing_region:
-                                self.selected_regions[file_path][existing_index]['text'] = f"{existing_region['page_text']} | {final_text}"
-                            else:
-                                self.selected_regions[file_path][existing_index]['text'] = f"文件名: {final_text}"
-                        else:
-                            # 创建一个特殊的区域来表示文件名模板
-                            filename_region = {
-                                'page': page_num,
-                                'rect': all_coords[0],  # 使用第一个区域的坐标作为主要坐标
-                                'all_coords': all_coords,  # 保存所有区域的坐标
-                                'text': f"文件名: {final_text}",
-                                'is_filename': True,
-                                'filename': final_text,
-                                'filename_text': f"文件名: {final_text}"
-                            }
-                            self.selected_regions[file_path].append(filename_region)
-                        
-                        total_pages_recognized += 1
-                    
-                    total_pages_processed += 1
-                    # 更新进度
-                    progress = (processed_files * 100.0 / total_files) + (page_num + 1) * 100.0 / (file_pages * total_files)
-                    progress_var.set(progress)
+                    progress_label.config(text=f"正在处理: {os.path.basename(file_path)}")
                     progress_window.update()
+                    
+                    # 确保文件的区域列表已初始化
+                    if file_path not in self.selected_regions:
+                        self.selected_regions[file_path] = []
+                    if file_path not in self.custom_filenames:
+                        self.custom_filenames[file_path] = {}
                 
+                # 获取页面
+                page = current_pdf[page_num]
+                
+                # 计算选择区域在PDF坐标系中的位置
+                zoom = 2.0 * self.scale_factor
+                
+                # 保持原始选择顺序提取文本
+                combined_text = []
+                
+                # 按照用户框选的原始顺序提取文本
+                for coords in self.filename_template_coords:
+                    x1, y1, x2, y2 = coords
+                    pdf_rect = fitz.Rect(x1/zoom, y1/zoom, x2/zoom, y2/zoom)
+                    
+                    # 提取文本并清理
+                    text = self.extract_text_from_region(page, pdf_rect)
+                    if text:
+                        combined_text.append(text)
+                
+                # 使用所有框选区域的坐标
+                all_coords = self.filename_template_coords
+                
+                # 组合所有区域的文本，用"-"连接
+                if combined_text:
+                    final_text = "-".join(combined_text)
+                    # 清理非法文件名字符
+                    final_text = re.sub(r'[\\/*?:"<>|]', '_', final_text)
+                    self.custom_filenames[file_path][page_num] = final_text
+                    total_pages_recognized += 1
+                else:
+                    final_text = ""
+                
+                # 查找这个页面是否已有区域
+                existing_region = None
+                existing_index = -1
+                for i, region in enumerate(self.selected_regions[file_path]):
+                    if region['page'] == page_num:
+                        existing_region = region
+                        existing_index = i
+                        break
+                
+                if existing_region:
+                    # 更新现有区域
+                    self.selected_regions[file_path][existing_index].update({
+                        'all_coords': all_coords,
+                        'is_filename': True,
+                        'filename': final_text if final_text else "[无内容]",
+                        'filename_text': f"文件名: {final_text if final_text else '[无内容]'}"
+                    })
+                    if 'page_text' in existing_region:
+                        self.selected_regions[file_path][existing_index]['text'] = \
+                            f"{existing_region['page_text']} | {final_text if final_text else '[无内容]'}"
+                    else:
+                        self.selected_regions[file_path][existing_index]['text'] = \
+                            f"文件名: {final_text if final_text else '[无内容]'}"
+                else:
+                    # 创建新区域
+                    filename_region = {
+                        'page': page_num,
+                        'rect': all_coords[0],
+                        'all_coords': all_coords,
+                        'text': f"文件名: {final_text if final_text else '[无内容]'}",
+                        'is_filename': True,
+                        'filename': final_text if final_text else "[无内容]",
+                        'filename_text': f"文件名: {final_text if final_text else '[无内容]'}"
+                    }
+                    self.selected_regions[file_path].append(filename_region)
+                
+                # 如果当前正在为特定图幅尺寸设置模板，保存模板信息
+                if self.current_size_key:
+                    if self.current_size_key not in self.filename_templates:
+                        self.filename_templates[self.current_size_key] = []
+                    # 只保存一次模板坐标
+                    if not self.filename_templates[self.current_size_key]:
+                        self.filename_templates[self.current_size_key] = all_coords
+                
+                processed_pages += 1
+                # 更新进度
+                progress = (processed_pages * 100.0) / total_pages
+                progress_var.set(progress)
+                progress_window.update()
+            
+            # 关闭最后打开的PDF文件
+            if current_pdf:
                 current_pdf.close()
-                processed_files += 1
             
             progress_window.destroy()
             
@@ -1657,7 +1940,8 @@ class PDFSplitterApp:
             self.update_region_list()
             
             # 显示识别结果
-            self.showinfo('完成', f'文件名识别完成！\n共识别出 {total_pages_recognized}/{total_pages_processed} 页的文件名。')
+            size_text = f" (图幅: {self.current_size_key})" if self.current_size_key else ""
+            self.showinfo('完成', f'文件名识别完成{size_text}！\n共识别出 {total_pages_recognized}/{total_pages} 页的文件名。')
             
         except Exception as e:
             self.showerror('错误', f'识别文件名时出错：{str(e)}')
@@ -1665,79 +1949,8 @@ class PDFSplitterApp:
                 progress_window.destroy()
 
     def extract_text_from_region(self, page, rect):
-        """从指定页面的区域提取文本"""
-        try:
-            # 使用改进的文本提取方法
-            blocks = page.get_text("dict", clip=rect)["blocks"]
-            
-            # 改进的文本排序逻辑：首先按行分组，然后在每行内从左到右排序
-            # 定义行容差 - 如果两个文本块的y坐标差距小于此值，认为它们在同一行
-            line_tolerance = 5 / (2.0 * self.scale_factor)  # 估计值，可能需要调整
-            
-            # 收集所有文本span
-            all_spans = []
-            for block in blocks:
-                if block["type"] == 0:  # 文本块
-                    for line in block["lines"]:
-                        for span in line["spans"]:
-                            # y_pos使用span的中点而不是顶部，这样更准确地表示行位置
-                            y_pos = (span["bbox"][1] + span["bbox"][3]) / 2
-                            x_pos = span["bbox"][0]  # 左边缘位置
-                            all_spans.append((y_pos, x_pos, span["text"]))
-            
-            if not all_spans:
-                return ""
-                
-            # 按y坐标粗略排序
-            all_spans.sort(key=lambda x: x[0])
-            
-            # 将span分组到不同的行
-            lines = []
-            current_line = [all_spans[0]]
-            current_y = all_spans[0][0]
-            
-            for span in all_spans[1:]:
-                span_y = span[0]
-                # 如果y坐标相差小于tolerance，认为是同一行
-                if abs(span_y - current_y) < line_tolerance:
-                    current_line.append(span)
-                else:
-                    # 将当前行按x坐标排序并添加到lines
-                    current_line.sort(key=lambda x: x[1])
-                    lines.append(current_line)
-                    # 开始新行
-                    current_line = [span]
-                    current_y = span_y
-            
-            # 添加最后一行
-            if current_line:
-                current_line.sort(key=lambda x: x[1])
-                lines.append(current_line)
-            
-            # 从每行中提取文本并合并
-            result_text = ""
-            for line in lines:
-                line_text = " ".join([span[2] for span in line])
-                if result_text:
-                    result_text += " " + line_text
-                else:
-                    result_text = line_text
-            
-            text = result_text
-        except Exception:
-            # 回退到简单模式
-            try:
-                text = page.get_text("text", clip=rect)
-            except:
-                text = ""
-                
-        # 处理多行文本：将换行符替换为空格，并移除多余空格
-        text = text.replace('\n', ' ').replace('\r', ' ')
-        # 替换连续的空格为单个空格
-        text = re.sub(r'\s+', ' ', text)
-        text = text.strip()
-        
-        return text
+        """Extracts text from a specified region on a page using the helper method."""
+        return self._extract_text_from_rect(page, rect)
 
     def center_window(self, window, width, height):
         """将窗口居中显示在屏幕上"""
@@ -1954,100 +2167,191 @@ class PDFSplitterApp:
         result = self.show_custom_messagebox(title, message, "question", 
                                           [("是", True), ("否", False)])
         return result
-    def edit_region_content(self):
-        """编辑选中区域的内容"""
-        selection = self.region_listbox.curselection()
-        if not selection:
-            self.showwarning("警告", "请先选择要编辑的内容")
+
+    def detect_page_sizes(self):
+        """识别所有PDF文件中的不同图幅尺寸"""
+        if not self.pdf_files:
+            self.showwarning("警告", "请先添加PDF文件")
             return
             
-        index = selection[0]
-        if index not in self.region_map:
-            return  # 如果选择的是标题行或空行，则不做处理
+        try:
+            # 显示进度窗口
+            progress_window = tk.Toplevel(self.root)
+            progress_window.title("识别图幅尺寸")
+            progress_window.geometry("300x150")
+            progress_window.transient(self.root)
+            self.center_dialog(progress_window)
             
-        # 获取文件路径和页码
-        file_path, page_num = self.region_map[index]
-        
-        # 创建编辑对话框
+            progress_label = ttk.Label(progress_window, text="正在识别图幅尺寸...")
+            progress_label.pack(pady=10)
+            
+            progress_var = tk.DoubleVar()
+            progress_bar = ttk.Progressbar(progress_window, variable=progress_var, maximum=100)
+            progress_bar.pack(fill=tk.X, padx=20, pady=10)
+            
+            # 清空之前的尺寸信息
+            self.page_sizes = {}
+            
+            total_files = len(self.pdf_files)
+            processed_files = 0
+            
+            all_sizes = set()  # 收集所有不同的尺寸
+            
+            for file_path in self.pdf_files:
+                progress_label.config(text=f"正在处理: {os.path.basename(file_path)}")
+                progress_window.update()
+                
+                pdf_doc = fitz.open(file_path)
+                self.page_sizes[file_path] = {}
+                
+                for page_num in range(len(pdf_doc)):
+                    page = pdf_doc[page_num]
+                    # 获取页面尺寸（四舍五入到整数）
+                    width = round(page.rect.width)
+                    height = round(page.rect.height)
+                    size_key = f"{width}x{height}"
+                    
+                    if size_key not in self.page_sizes[file_path]:
+                        self.page_sizes[file_path][size_key] = []
+                    self.page_sizes[file_path][size_key].append(page_num)
+                    all_sizes.add(size_key)
+                
+                pdf_doc.close()
+                processed_files += 1
+                progress_var.set(processed_files * 100 / total_files)
+            
+            progress_window.destroy()
+            
+            # 显示识别结果对话框
+            self.show_size_detection_results(all_sizes)
+            
+        except Exception as e:
+            self.showerror("错误", f"识别图幅尺寸时出错：{str(e)}")
+            if 'progress_window' in locals() and progress_window.winfo_exists():
+                progress_window.destroy()
+
+    def show_size_detection_results(self, all_sizes):
+        """显示图幅尺寸识别结果"""
         dialog = tk.Toplevel(self.root)
-        dialog.title("编辑内容")
-        dialog.geometry("400x300")
-        dialog.transient(self.root)  # 设置为主窗口的子窗口
+        dialog.title("图幅尺寸识别结果")
+        dialog.geometry("500x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
         
-        # 创建文本编辑区域
-        main_frame = ttk.Frame(dialog, padding=10)
+        # 创建主框架
+        main_frame = ttk.Frame(dialog, padding=0)
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # 添加说明标签
-        ttk.Label(main_frame, text="请编辑内容:").pack(anchor=tk.W)
+        # 创建标题栏
+        title_frame = tk.Frame(main_frame, height=6, bg="#3498db")
+        title_frame.pack(fill=tk.X)
         
-        # 创建文本编辑框
-        text_edit = tk.Text(main_frame, wrap=tk.WORD, height=10)
-        text_edit.pack(fill=tk.BOTH, expand=True, pady=5)
+        # 内容区域
+        content_frame = ttk.Frame(main_frame, padding=(20, 15, 20, 10))
+        content_frame.pack(fill=tk.BOTH, expand=True)
         
-        # 获取当前内容
-        current_text = self.region_listbox.get(index)
-        if ": " in current_text:
-            current_text = current_text.split(": ", 1)[1]  # 去掉"页面 X: "前缀
-        text_edit.insert("1.0", current_text)
+        # 标题
+        header_label = ttk.Label(content_frame, text="检测到以下图幅尺寸：", 
+                               font=("Arial", 12, "bold"))
+        header_label.pack(anchor=tk.W, pady=(0, 10))
+        
+        # 创建表格框架
+        table_frame = ttk.Frame(content_frame)
+        table_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 创建表格
+        columns = ("尺寸", "页数", "页码提取区域", "文件名提取区域")
+        tree = ttk.Treeview(table_frame, columns=columns, show="headings")
+        
+        # 设置列标题
+        for col in columns:
+            tree.heading(col, text=col)
+            tree.column(col, width=100)
+        
+        # 添加滚动条
+        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=tree.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # 填充数据
+        for size in sorted(all_sizes):
+            # 计算使用该尺寸的页面总数
+            total_pages = sum(len(sizes[size]) for sizes in self.page_sizes.values() if size in sizes)
+            page_status = "未设置" if size not in self.page_templates else "已设置"
+            filename_status = "未设置" if size not in self.filename_templates else "已设置"
+            tree.insert("", tk.END, values=(size, total_pages, page_status, filename_status))
+        
+        # 分隔线
+        separator = ttk.Separator(main_frame, orient="horizontal")
+        separator.pack(fill=tk.X, padx=0, pady=0)
         
         # 按钮区域
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, pady=(10, 0))
+        btn_frame = ttk.Frame(main_frame, padding=(15, 10))
+        btn_frame.pack(fill=tk.X)
         
-        def save_changes():
-            # 获取编辑后的文本
-            new_text = text_edit.get("1.0", tk.END).strip()
-            
-            # 更新区域内容
-            regions = self.selected_regions[file_path]
-            updated = False
-            for region in regions:
-                if region["page"] == page_num:
-                    if "[无内容]" in current_text:
-                        # 如果原来是无内容，创建新的区域
-                        new_region = {
-                            "page": page_num,
-                            "text": new_text,
-                            "rect": (0, 0, 0, 0)  # 空矩形
-                        }
-                        self.selected_regions[file_path].append(new_region)
-                    else:
-                        # 更新现有区域
-                        region["text"] = new_text
-                    updated = True
-                    break
-            
-            if not updated and "[无内容]" in current_text:
-                # 如果没有找到对应的区域且是无内容页面，创建新的区域
-                new_region = {
-                    "page": page_num,
-                    "text": new_text,
-                    "rect": (0, 0, 0, 0)  # 空矩形
-                }
-                self.selected_regions[file_path].append(new_region)
-            
-            # 更新显示
-            self.update_region_list()
+        def on_set_page_template():
+            selection = tree.selection()
+            if not selection:
+                self.showwarning("警告", "请先选择一个图幅尺寸")
+                return
+                
+            size_key = tree.item(selection[0])["values"][0]
+            self.current_size_key = size_key
             dialog.destroy()
-            self.showinfo("成功", "内容已更新")
-        
-        def cancel():
+            # 开始为选中的尺寸设置页码提取区域
+            self.start_template_selection_for_size(size_key, template_type="page")
+            
+        def on_set_filename_template():
+            selection = tree.selection()
+            if not selection:
+                self.showwarning("警告", "请先选择一个图幅尺寸")
+                return
+                
+            size_key = tree.item(selection[0])["values"][0]
+            self.current_size_key = size_key
             dialog.destroy()
+            # 开始为选中的尺寸设置文件名提取区域
+            self.start_template_selection_for_size(size_key, template_type="filename")
         
-        # 添加保存和取消按钮
-        ttk.Button(btn_frame, text="保存", command=save_changes).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(btn_frame, text="取消", command=cancel).pack(side=tk.RIGHT, padx=5)
+        # 设置页码提取区域按钮
+        set_page_btn = ttk.Button(btn_frame, text="设置页码提取区域", 
+                                command=on_set_page_template)
+        set_page_btn.pack(side=tk.RIGHT, padx=5)
         
-        # 设置对话框位置
+        # 设置文件名提取区域按钮
+        set_filename_btn = ttk.Button(btn_frame, text="设置文件名提取区域", 
+                                    command=on_set_filename_template)
+        set_filename_btn.pack(side=tk.RIGHT, padx=5)
+        
+        # 关闭按钮
+        close_btn = ttk.Button(btn_frame, text="关闭", command=dialog.destroy)
+        close_btn.pack(side=tk.RIGHT, padx=5)
+        
+        # 居中显示对话框
         self.center_dialog(dialog)
         
-        # 设置焦点
-        text_edit.focus_set()
-        
-        # 等待对话框关闭
         dialog.wait_window()
 
+    def start_template_selection_for_size(self, size_key, template_type="page"):
+        """为指定尺寸开始模板选择过程"""
+        # 找到第一个具有该尺寸的页面并显示
+        for file_path in self.pdf_files:
+            if size_key in self.page_sizes[file_path]:
+                page_num = self.page_sizes[file_path][size_key][0]
+                # 加载对应的文件和页面
+                self.load_pdf_file(self.pdf_files.index(file_path))
+                self.current_page = page_num
+                self.update_page_display()
+                break
+        
+        # 根据模板类型开始相应的选择过程
+        if template_type == "page":
+            self.start_template_selection(mode="double")  # 或根据需要选择mode="single"
+            self.template_status.config(text=f"正在为图幅 {size_key} 设置页码提取区域...")
+        else:  # filename
+            self.start_filename_template_selection()
+            self.template_status.config(text=f"正在为图幅 {size_key} 设置文件名提取区域...")
 
 def main():
     root = tk.Tk()

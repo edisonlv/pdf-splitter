@@ -1,0 +1,2 @@
+        # 添加编辑按钮
+        ttk.Button(region_btn_frame, text="编辑文本", command=self.edit_region_text).pack(side=tk.LEFT, padx=5)

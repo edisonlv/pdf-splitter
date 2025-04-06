@@ -147,8 +147,6 @@ class PDFSplitterApp:
         
         ttk.Button(region_btn_frame, text="删除区域", command=self.remove_region).pack(side=tk.LEFT, padx=5)
         ttk.Button(region_btn_frame, text="清除所有", command=self.clear_regions).pack(side=tk.LEFT, padx=5)
-        # 添加编辑内容按钮
-        ttk.Button(region_btn_frame, text="编辑内容", command=self.edit_region_content).pack(side=tk.LEFT, padx=5)
     
     def add_pdf_files(self):
         """添加PDF文件到列表"""
@@ -582,82 +580,66 @@ class PDFSplitterApp:
         self.region_map = {}
         current_index = 0
         
+        # 检查是否有任何区域
+        has_any_regions = False
+        for file_path in self.pdf_files:
+            if file_path in self.selected_regions and self.selected_regions[file_path]:
+                has_any_regions = True
+                break
+        
         if not self.pdf_files:
             # 如果没有文件，显示提示信息
             self.region_listbox.insert(tk.END, "请先添加PDF文件")
             return
-            
-        # 遍历所有文件
+        elif not has_any_regions:
+            # 如果有文件但没有区域，显示提示信息
+            self.region_listbox.insert(tk.END, "请在PDF上选择区域")
+            return
+        
+        # 遍历所有文件的区域
         for file_path in self.pdf_files:
             file_name = os.path.basename(file_path)
+            regions = self.selected_regions.get(file_path, [])
+            
+            if not regions:
+                continue  # 跳过没有区域的文件
             
             # 添加文件名作为标题
             self.region_listbox.insert(tk.END, f"=== {file_name} ===")
             current_index += 1
             
-            try:
-                # 打开PDF文件获取总页数
-                with fitz.open(file_path) as pdf:
-                    total_pages = len(pdf)
-                    
-                    # 确保selected_regions中有这个文件的条目
-                    if file_path not in self.selected_regions:
-                        self.selected_regions[file_path] = []
-                    
-                    # 获取当前文件的所有选定区域
-                    regions = self.selected_regions[file_path]
-                    
-                    # 为每一页创建一个映射
-                    page_regions = {}
-                    for region in regions:
-                        page_num = region["page"]
-                        if page_num not in page_regions:
-                            page_regions[page_num] = []
-                        page_regions[page_num].append(region)
-                    
-                    # 显示所有页面
-                    for page_num in range(total_pages):
-                        if page_num in page_regions:
-                            # 显示该页面的所有区域
-                            for region in page_regions[page_num]:
-                                if "current_page" in region and "filename" in region:
-                                    # 既有页码又有文件名
-                                    item_text = f"页面 {page_num + 1}: [第 {region['current_page']} 张] [{region['filename']}]"
-                                elif region.get("is_filename"):
-                                    # 只有文件名
-                                    item_text = f"页面 {page_num + 1}: [文件名] {region['filename']}"
-                                elif "current_page" in region and "total_pages" in region:
-                                    # 只有页码
-                                    item_text = f"页面 {page_num + 1}: 第 {region['current_page']} 张 共 {region['total_pages']} 张"
-                                else:
-                                    # 普通区域
-                                    text_preview = region["text"].strip()
-                                    if len(text_preview) > 30:
-                                        text_preview = text_preview[:30] + "..."
-                                    item_text = f"页面 {page_num + 1}: {text_preview}"
-                                
-                                self.region_listbox.insert(tk.END, item_text)
-                                # 保存映射关系
-                                self.region_map[current_index] = (file_path, page_num)
-                                current_index += 1
-                        else:
-                            # 显示没有区域的页面
-                            item_text = f"页面 {page_num + 1}: [无内容]"
-                            self.region_listbox.insert(tk.END, item_text)
-                            # 保存映射关系
-                            self.region_map[current_index] = (file_path, page_num)
-                            current_index += 1
-                    
-                    # 添加空行分隔
-                    self.region_listbox.insert(tk.END, "")
-                    current_index += 1
-                    
-            except Exception as e:
-                self.showerror("错误", f"处理文件 {file_name} 时出错: {str(e)}")
-                continue
+            # 添加该文件的所有区域
+            for region in regions:
+                page_num = region['page'] + 1
+                
+                if 'current_page' in region and 'filename' in region:
+                    # 既有页码又有文件名
+                    item_text = f"页面 {page_num}: [第 {region['current_page']} 张] [{region['filename']}]"
+                elif region.get('is_filename'):
+                    # 只有文件名
+                    item_text = f"页面 {page_num}: [文件名] {region['filename']}"
+                elif 'current_page' in region and 'total_pages' in region:
+                    # 只有页码
+                    item_text = f"页面 {page_num}: 第 {region['current_page']} 张 共 {region['total_pages']} 张"
+                else:
+                    # 普通区域
+                    text_preview = region['text'].strip()
+                    if len(text_preview) > 30:
+                        text_preview = text_preview[:30] + "..."
+                    item_text = f"页面 {page_num}: {text_preview}"
+                
+                self.region_listbox.insert(tk.END, item_text)
+                # 保存映射关系
+                self.region_map[current_index] = (file_path, region['page'])
+                current_index += 1
+            
+            # 添加空行分隔
+            self.region_listbox.insert(tk.END, "")
+            current_index += 1
         
         # 绑定双击事件
         self.region_listbox.bind("<Double-1>", self.on_region_double_click)
+    
     def on_region_double_click(self, event):
         """处理区域列表的双击事件"""
         selection = self.region_listbox.curselection()
@@ -1954,100 +1936,6 @@ class PDFSplitterApp:
         result = self.show_custom_messagebox(title, message, "question", 
                                           [("是", True), ("否", False)])
         return result
-    def edit_region_content(self):
-        """编辑选中区域的内容"""
-        selection = self.region_listbox.curselection()
-        if not selection:
-            self.showwarning("警告", "请先选择要编辑的内容")
-            return
-            
-        index = selection[0]
-        if index not in self.region_map:
-            return  # 如果选择的是标题行或空行，则不做处理
-            
-        # 获取文件路径和页码
-        file_path, page_num = self.region_map[index]
-        
-        # 创建编辑对话框
-        dialog = tk.Toplevel(self.root)
-        dialog.title("编辑内容")
-        dialog.geometry("400x300")
-        dialog.transient(self.root)  # 设置为主窗口的子窗口
-        
-        # 创建文本编辑区域
-        main_frame = ttk.Frame(dialog, padding=10)
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # 添加说明标签
-        ttk.Label(main_frame, text="请编辑内容:").pack(anchor=tk.W)
-        
-        # 创建文本编辑框
-        text_edit = tk.Text(main_frame, wrap=tk.WORD, height=10)
-        text_edit.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # 获取当前内容
-        current_text = self.region_listbox.get(index)
-        if ": " in current_text:
-            current_text = current_text.split(": ", 1)[1]  # 去掉"页面 X: "前缀
-        text_edit.insert("1.0", current_text)
-        
-        # 按钮区域
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        def save_changes():
-            # 获取编辑后的文本
-            new_text = text_edit.get("1.0", tk.END).strip()
-            
-            # 更新区域内容
-            regions = self.selected_regions[file_path]
-            updated = False
-            for region in regions:
-                if region["page"] == page_num:
-                    if "[无内容]" in current_text:
-                        # 如果原来是无内容，创建新的区域
-                        new_region = {
-                            "page": page_num,
-                            "text": new_text,
-                            "rect": (0, 0, 0, 0)  # 空矩形
-                        }
-                        self.selected_regions[file_path].append(new_region)
-                    else:
-                        # 更新现有区域
-                        region["text"] = new_text
-                    updated = True
-                    break
-            
-            if not updated and "[无内容]" in current_text:
-                # 如果没有找到对应的区域且是无内容页面，创建新的区域
-                new_region = {
-                    "page": page_num,
-                    "text": new_text,
-                    "rect": (0, 0, 0, 0)  # 空矩形
-                }
-                self.selected_regions[file_path].append(new_region)
-            
-            # 更新显示
-            self.update_region_list()
-            dialog.destroy()
-            self.showinfo("成功", "内容已更新")
-        
-        def cancel():
-            dialog.destroy()
-        
-        # 添加保存和取消按钮
-        ttk.Button(btn_frame, text="保存", command=save_changes).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(btn_frame, text="取消", command=cancel).pack(side=tk.RIGHT, padx=5)
-        
-        # 设置对话框位置
-        self.center_dialog(dialog)
-        
-        # 设置焦点
-        text_edit.focus_set()
-        
-        # 等待对话框关闭
-        dialog.wait_window()
-
 
 def main():
     root = tk.Tk()
